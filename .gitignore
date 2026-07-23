@@ -1,0 +1,12 @@
+node_modules/
+
+# Real secret (API_KEY) - .env.example is the template, this is not
+.env
+
+# WhatsApp login sessions - equivalent to account credentials, never share
+.wwebjs_auth/
+.wwebjs_cache/
+
+# OS/editor cruft
+.DS_Store
+*.log
