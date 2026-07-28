@@ -66,32 +66,76 @@ All endpoints require header `X-API-KEY: <API_KEY>`.
 Use `pm2` or Windows Task Scheduler / NSSM to keep `node index.js` running
 alongside the Django app. It listens on port 3001 by default.
 
-## Multi-client mode (one gateway, several client deployments)
+## Multi-client mode (one gateway, many clients, one key PER CLIENT)
 
-If several separate client apps (different Django deployments/domains, e.g.
-several branches of the same project) share this one gateway instance
-instead of each running their own, use `SCOPED_API_KEYS` (see
-`.env.example`) so a leaked/compromised key for one client can't touch
-another client's WhatsApp sessions:
+One gateway process serves every client of every project (Naweb, Gweb,
+every branch of each) — never a separate gateway per client, that's the
+RAM/ops multiplication we deliberately avoid. Isolation between clients
+comes entirely from `SCOPED_API_KEYS` (see `.env.example`): **one scoped
+key per client**, not one per project. A leaked/compromised key for one
+client then can never touch any *other* client's WhatsApp sessions — not
+even two branches of the same project.
 
 ```
-SCOPED_API_KEYS=naweb:naweb-secret-key,gweb:gweb-secret-key
+SCOPED_API_KEYS=naweb-autonation:8f2a...,naweb-starchem:1c9e...,gweb-shopa:44bb...
 ```
 
-- `API_KEY` stays the master/admin key — unrestricted, works on any
-  session id. Keep it private; don't hand it to individual clients.
-- Each scoped key can only start/query/send on session ids starting with
-  its prefix + `-` (e.g. the `naweb` key only works with sessions like
-  `naweb-clienta`, `naweb-clientb`; never `gweb-anything`). A request
-  using a scoped key against a session outside its prefix gets `403`.
-- Give each client deployment its own scoped key + a session-id naming
-  convention (`<client-slug>-<sender-label>`) when they add senders in
-  their own project's WhatsApp settings page.
-- Trade-off you're accepting by sharing one process across clients: if
-  this one gateway crashes or restarts, sending stops for *every* client
-  using it at once (not just one), and RAM is shared across all their
-  active sessions (~150-250MB per connected session). Isolation is per-key,
-  not per-process — full isolation still means separate gateway instances.
+- `API_KEY` (singular, no colon) stays the master/admin key — unrestricted,
+  works on any session id. Keep it private, never hand it to a client.
+- Each `SCOPED_API_KEYS` entry is `prefix:key`. A request authenticated with
+  that key may only touch session ids starting with `<prefix>-`. Wrong
+  session → `403`.
+- The project tag (`naweb`/`gweb`) is a **fixed constant baked into each
+  project's own codebase**, not something you type per client — every
+  session id that project generates automatically starts with it. Only the
+  part after that (the client name) plus a random uuid come from the
+  client's own domain/company, fully automatic, nothing typed.
+
+### Onboarding a new client — worked example (Autonation, a Naweb client)
+
+1. In Autonation's own Naweb deployment, staff opens `/whatsapp/settings/`
+   and adds a sender. The system generates its session id by itself —
+   something like:
+   ```
+   naweb-autonation-a1b2c3d4
+   ```
+   `naweb-` = fixed Naweb project tag. `autonation` = slugified from that
+   client's own domain or company name (COM11). `a1b2c3d4` = random, just
+   for uniqueness. Nobody types any of this.
+2. Read the **middle part** off the sender row in that settings page
+   (shown under the sender's name) — here, `autonation`.
+3. Generate a real secret for this client (don't use a guessable string):
+   ```bash
+   openssl rand -hex 32
+   ```
+   Say it prints `8f2a9d...` (some long random string).
+4. On the server running `wa-gateway`, edit `.env` and add ONE new entry to
+   the existing `SCOPED_API_KEYS` line (comma-separated, don't remove the
+   others):
+   ```
+   SCOPED_API_KEYS=naweb-autonation:8f2a9d...,<...whatever was already there...>
+   ```
+5. Restart so it picks up the change:
+   ```bash
+   pm2 restart wa-gateway
+   pm2 logs wa-gateway --lines 20   # confirm it loaded the new key
+   ```
+6. Paste that **same** `8f2a9d...` string into Autonation's own
+   `WhatsappConfig.api_key` (Naweb's `/whatsapp/settings/` or Django admin).
+   `gateway_url` stays whatever this shared gateway's actual address is
+   (e.g. `http://localhost:3001` if co-located on the same server).
+7. Connect the sender (اتصال / QR) from Autonation's settings page, scan,
+   test one send.
+
+That's the whole per-client checklist, repeated identically for every new
+client of every project, forever — one line added to `SCOPED_API_KEYS`, one
+restart, one key pasted into that client's own config.
+
+**Trade-off you're still accepting** by sharing one process: if this
+gateway crashes or restarts, sending stops for *every* client at once, and
+RAM is shared across everyone's active sessions (~150-250MB per connected
+session — watch total usage as client count grows; see Naweb's
+`whatsapp/README.md` for what to do when RAM becomes the actual bottleneck).
 
 After changing `.env` or `index.js`, the running process must be restarted
 to pick up the change (`pm2 restart wa-gateway`) — Node doesn't hot-reload.
