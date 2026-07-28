@@ -65,3 +65,35 @@ All endpoints require header `X-API-KEY: <API_KEY>`.
 
 Use `pm2` or Windows Task Scheduler / NSSM to keep `node index.js` running
 alongside the Django app. It listens on port 3001 by default.
+
+## Multi-client mode (one gateway, several client deployments)
+
+If several separate client apps (different Django deployments/domains, e.g.
+several branches of the same project) share this one gateway instance
+instead of each running their own, use `SCOPED_API_KEYS` (see
+`.env.example`) so a leaked/compromised key for one client can't touch
+another client's WhatsApp sessions:
+
+```
+SCOPED_API_KEYS=naweb:naweb-secret-key,gweb:gweb-secret-key
+```
+
+- `API_KEY` stays the master/admin key — unrestricted, works on any
+  session id. Keep it private; don't hand it to individual clients.
+- Each scoped key can only start/query/send on session ids starting with
+  its prefix + `-` (e.g. the `naweb` key only works with sessions like
+  `naweb-clienta`, `naweb-clientb`; never `gweb-anything`). A request
+  using a scoped key against a session outside its prefix gets `403`.
+- Give each client deployment its own scoped key + a session-id naming
+  convention (`<client-slug>-<sender-label>`) when they add senders in
+  their own project's WhatsApp settings page.
+- Trade-off you're accepting by sharing one process across clients: if
+  this one gateway crashes or restarts, sending stops for *every* client
+  using it at once (not just one), and RAM is shared across all their
+  active sessions (~150-250MB per connected session). Isolation is per-key,
+  not per-process — full isolation still means separate gateway instances.
+
+After changing `.env` or `index.js`, the running process must be restarted
+to pick up the change (`pm2 restart wa-gateway`) — Node doesn't hot-reload.
+Existing WhatsApp logins are unaffected (persisted in `.wwebjs_auth/`), so a
+restart does not require re-scanning any QR codes.

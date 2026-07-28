@@ -11,7 +11,32 @@ const qrcode = require('qrcode');
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 
 const PORT = process.env.PORT || 3001;
-const API_KEY = process.env.API_KEY || 'change-this-shared-secret';
+const API_KEY = process.env.API_KEY || 'change-this-shared-secret'; // master key: unrestricted, any session_id
+
+// Per-client scoped keys, e.g. in .env:
+//   SCOPED_API_KEYS=naweb:naweb-secret-key,gweb:gweb-secret-key
+// A request authenticated with a scoped key may only touch sessions whose
+// id starts with "<prefix>-" (e.g. key "naweb:xyz" can only use session ids
+// like "naweb-clienta", never "gweb-anything"). This lets many clients share
+// one gateway process without one client's leaked key exposing every other
+// client's WhatsApp sessions.
+const SCOPED_API_KEYS = new Map(); // key -> prefix
+(process.env.SCOPED_API_KEYS || '').split(',').forEach((entry) => {
+    const trimmed = entry.trim();
+    if (!trimmed) return;
+    const sep = trimmed.indexOf(':');
+    if (sep === -1) {
+        console.warn(`[config] ignoring malformed SCOPED_API_KEYS entry: "${trimmed}" (expected prefix:key)`);
+        return;
+    }
+    const prefix = trimmed.slice(0, sep).trim();
+    const key = trimmed.slice(sep + 1).trim();
+    if (!prefix || !key) return;
+    SCOPED_API_KEYS.set(key, prefix);
+});
+if (SCOPED_API_KEYS.size > 0) {
+    console.log(`[config] loaded ${SCOPED_API_KEYS.size} scoped API key(s): ${[...SCOPED_API_KEYS.values()].join(', ')}`);
+}
 
 // A single session's internal error (e.g. whatsapp-web.js failing to clean
 // up its lockfile on logout) must not take down every other connected
@@ -34,10 +59,30 @@ app.use((req, res, next) => {
 const sessions = new Map();
 
 function requireApiKey(req, res, next) {
-    if (req.get('X-API-KEY') !== API_KEY) {
-        return res.status(401).json({ ok: false, error: 'unauthorized' });
+    const key = req.get('X-API-KEY');
+    if (key === API_KEY) {
+        req.sessionPrefix = null; // master key: no restriction
+        return next();
     }
-    next();
+    if (SCOPED_API_KEYS.has(key)) {
+        req.sessionPrefix = SCOPED_API_KEYS.get(key); // scoped key: restricted below
+        return next();
+    }
+    return res.status(401).json({ ok: false, error: 'unauthorized' });
+}
+
+// Applied after requireApiKey on every route that names a session (either
+// via :id in the URL or `session` in the JSON body). A scoped key may only
+// touch session ids it owns; the master key (req.sessionPrefix === null)
+// always passes.
+function requireSessionAccess(req, res, next) {
+    if (req.sessionPrefix === null) return next(); // master key
+    const sessionId = req.params.id || (req.body && req.body.session);
+    if (sessionId && sessionId.startsWith(`${req.sessionPrefix}-`)) return next();
+    return res.status(403).json({
+        ok: false,
+        error: `this API key may only access sessions starting with "${req.sessionPrefix}-"`,
+    });
 }
 
 function getOrCreateSession(sessionId) {
@@ -94,20 +139,20 @@ function getOrCreateSession(sessionId) {
 }
 
 // Start (or resume) a session for a sender.
-app.post('/sessions/:id/start', requireApiKey, (req, res) => {
+app.post('/sessions/:id/start', requireApiKey, requireSessionAccess, (req, res) => {
     const s = getOrCreateSession(req.params.id);
     res.json({ ok: true, status: s.status });
 });
 
 // Poll connection status.
-app.get('/sessions/:id/status', requireApiKey, (req, res) => {
+app.get('/sessions/:id/status', requireApiKey, requireSessionAccess, (req, res) => {
     const s = sessions.get(req.params.id);
     if (!s) return res.json({ ok: true, status: 'not_started' });
     res.json({ ok: true, status: s.status, number: s.number });
 });
 
 // Current QR code (data URL) while status === 'qr'.
-app.get('/sessions/:id/qr', requireApiKey, async (req, res) => {
+app.get('/sessions/:id/qr', requireApiKey, requireSessionAccess, async (req, res) => {
     const s = sessions.get(req.params.id);
     if (!s || !s.qr) return res.json({ ok: true, qr: null });
     const dataUrl = await qrcode.toDataURL(s.qr);
@@ -115,7 +160,7 @@ app.get('/sessions/:id/qr', requireApiKey, async (req, res) => {
 });
 
 // Log a session out and drop it (lets a fresh QR be issued).
-app.post('/sessions/:id/logout', requireApiKey, async (req, res) => {
+app.post('/sessions/:id/logout', requireApiKey, requireSessionAccess, async (req, res) => {
     const s = sessions.get(req.params.id);
     if (!s) return res.json({ ok: true });
     try {
@@ -153,7 +198,7 @@ async function resolveSendTarget(req, res) {
 
 // Send a text message. body: { session, phone, message }
 // phone: digits only, E.164 without '+' (e.g. "201234567890").
-app.post('/send', requireApiKey, async (req, res) => {
+app.post('/send', requireApiKey, requireSessionAccess, async (req, res) => {
     const { session, phone, message } = req.body || {};
     if (!session || !phone || !message) {
         return res.status(400).json({ ok: false, error: 'session, phone and message are required' });
@@ -171,7 +216,7 @@ app.post('/send', requireApiKey, async (req, res) => {
 
 // Send a document (e.g. an invoice PDF) with an optional text caption.
 // body: { session, phone, message, filename, pdf_base64 }
-app.post('/send-document', requireApiKey, async (req, res) => {
+app.post('/send-document', requireApiKey, requireSessionAccess, async (req, res) => {
     const { session, phone, message, filename, pdf_base64 } = req.body || {};
     if (!session || !phone || !pdf_base64) {
         return res.status(400).json({ ok: false, error: 'session, phone and pdf_base64 are required' });
