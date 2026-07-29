@@ -91,6 +91,21 @@ SCOPED_API_KEYS=naweb-autonation:8f2a...,naweb-starchem:1c9e...,gweb-shopa:44bb.
   part after that (the client name) plus a random uuid come from the
   client's own domain/company, fully automatic, nothing typed.
 
+### Do this, in order
+
+  1. Invent a password (or openssl rand -hex 32). or from `https://www.browserling.com/tools/random-hex` Say you pick:
+  kJ8mN2pQ7rT4vX9wZ3aB6cD1eF5gH0iL
+
+  2. wa-gateway .env on the server:
+  SCOPED_API_KEYS=naweb:naweb-secret-key,gweb-mohammed-mahmoud:kJ8mN2pQ7rT4vX9wZ3aB6cD1eF5gH0iL
+  then pm2 restart wa-gateway
+
+  3. Gweb → حاتفم → ةباوبلا تادادعا API:
+  kJ8mN2pQ7rT4vX9wZ3aB6cD1eF5gH0iL
+  Save.
+
+  4. Click لاصتا / QR → scan.
+
 ### Onboarding a new client — worked example (Autonation, a Naweb client)
 
 1. In Autonation's own Naweb deployment, staff opens `/whatsapp/settings/`
