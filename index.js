@@ -21,22 +21,72 @@ const API_KEY = process.env.API_KEY || 'change-this-shared-secret'; // master ke
 // one gateway process without one client's leaked key exposing every other
 // client's WhatsApp sessions.
 const SCOPED_API_KEYS = new Map(); // key -> prefix
-(process.env.SCOPED_API_KEYS || '').split(',').forEach((entry) => {
-    const trimmed = entry.trim();
-    if (!trimmed) return;
-    const sep = trimmed.indexOf(':');
-    if (sep === -1) {
-        console.warn(`[config] ignoring malformed SCOPED_API_KEYS entry: "${trimmed}" (expected prefix:key)`);
-        return;
-    }
-    const prefix = trimmed.slice(0, sep).trim();
-    const key = trimmed.slice(sep + 1).trim();
-    if (!prefix || !key) return;
-    SCOPED_API_KEYS.set(key, prefix);
-});
-if (SCOPED_API_KEYS.size > 0) {
+
+// Re-read the key list from .env WITHOUT restarting.
+//
+// Onboarding a client only means adding one line to SCOPED_API_KEYS. That used
+// to need `pm2 restart`, which kills every connected client's Chromium and
+// forces them all to reconnect - a bad trade for a config change that affects
+// nobody but the new client. This reloads the keys in place; live sessions are
+// untouched.
+function loadScopedApiKeys() {
+    const fs = require('fs');
+    const path = require('path');
+    let raw = process.env.SCOPED_API_KEYS || '';
+
+    // Read the file directly - dotenv only populates process.env once, so on a
+    // reload the file is the source of truth.
+    try {
+        const envText = fs.readFileSync(path.join(__dirname, '.env'), 'utf8');
+        const line = envText.split(/\r?\n/).find((l) => l.trim().startsWith('SCOPED_API_KEYS='));
+        if (line) raw = line.slice(line.indexOf('=') + 1).trim();
+    } catch (err) { /* no .env - fall back to the environment */ }
+
+    const next = new Map();
+    raw.split(',').forEach((entry) => {
+        const trimmed = entry.trim();
+        if (!trimmed) return;
+        const sep = trimmed.indexOf(':');
+        if (sep === -1) {
+            console.warn(`[config] ignoring malformed SCOPED_API_KEYS entry: "${trimmed}" (expected prefix:key)`);
+            return;
+        }
+        const prefix = trimmed.slice(0, sep).trim();
+        const key = trimmed.slice(sep + 1).trim();
+        if (!prefix || !key) return;
+        next.set(key, prefix);
+    });
+
+    SCOPED_API_KEYS.clear();
+    next.forEach((prefix, key) => SCOPED_API_KEYS.set(key, prefix));
     console.log(`[config] loaded ${SCOPED_API_KEYS.size} scoped API key(s): ${[...SCOPED_API_KEYS.values()].join(', ')}`);
 }
+
+loadScopedApiKeys();
+
+// Pick up .env edits automatically, so adding a client needs no restart and no
+// command at all. Debounced: editors often write a file in several chunks.
+try {
+    const fs = require('fs');
+    const path = require('path');
+    let pending = null;
+    fs.watch(path.join(__dirname, '.env'), () => {
+        clearTimeout(pending);
+        pending = setTimeout(() => {
+            console.log('[config] .env changed - reloading scoped API keys');
+            loadScopedApiKeys();
+        }, 500);
+    });
+} catch (err) {
+    console.warn('[config] could not watch .env (edit + SIGHUP still works):', err.message);
+}
+
+// Manual reload for hosts where file watching is unreliable (some Docker
+// bind-mounts, network shares):  kill -HUP <pid>   /   pm2 sendSignal SIGHUP wa-gateway
+process.on('SIGHUP', () => {
+    console.log('[config] SIGHUP - reloading scoped API keys');
+    loadScopedApiKeys();
+});
 
 // A single session's internal error (e.g. whatsapp-web.js failing to clean
 // up its lockfile on logout) must not take down every other connected
@@ -85,9 +135,30 @@ function requireSessionAccess(req, res, next) {
     });
 }
 
+// Tear down a session's browser and forget it, so the next start builds a
+// fresh one. Never throws: on Windows destroy() often fails with EBUSY
+// because Chromium still holds files in .wwebjs_auth - that must not stop us
+// dropping the dead entry, which is the whole point.
+async function destroySession(sessionId) {
+    const s = sessions.get(sessionId);
+    sessions.delete(sessionId);
+    if (s && s.client) {
+        try {
+            await s.client.destroy();
+        } catch (err) {
+            console.warn(`[${sessionId}] destroy() failed (ignored):`, err.message);
+        }
+    }
+}
+
 function getOrCreateSession(sessionId) {
     let s = sessions.get(sessionId);
-    if (s) return s;
+    // A dead session must NOT be handed back: whatsapp-web.js will never
+    // re-initialize it, so the UI would sit on "disconnected" forever and the
+    // only cure would be restarting the whole gateway (which is what used to
+    // happen). Callers hitting /start clear it out first - see the endpoint.
+    if (s && s.status !== 'disconnected') return s;
+    if (s) sessions.delete(sessionId);
 
     s = { client: null, status: 'starting', qr: null, number: null };
     sessions.set(sessionId, s);
@@ -122,6 +193,15 @@ function getOrCreateSession(sessionId) {
         s.status = 'disconnected';
         s.qr = null;
         console.log(`[${sessionId}] disconnected: ${reason}`);
+        // Drop the dead client so the next /start rebuilds from scratch.
+        // Without this the entry lingers in `sessions` holding a browser that
+        // will never reconnect. Delayed a little to let whatsapp-web.js finish
+        // its own logout cleanup first, which reduces the Windows EBUSY noise.
+        setTimeout(() => {
+            if (sessions.get(sessionId) === s) {
+                destroySession(sessionId).catch(() => {});
+            }
+        }, 3000);
     });
 
     client.on('auth_failure', (msg) => {
@@ -133,14 +213,44 @@ function getOrCreateSession(sessionId) {
     console.log(`[${sessionId}] initializing...`);
     client.initialize().catch((err) => {
         s.status = 'disconnected';
-        console.error(`[${sessionId}] initialize() failed:`, err);
+        console.error(`[${sessionId}] initialize() failed:`, err.message);
+        // "Execution context was destroyed" / "Could not load response body"
+        // are transient puppeteer races - usually the page navigated while
+        // whatsapp-web.js was injecting. One clean retry fixes it; without it
+        // the session sits dead until someone presses connect.
+        if (!s.retried) {
+            s.retried = true;
+            console.log(`[${sessionId}] retrying once in 10s...`);
+            setTimeout(async () => {
+                await destroySession(sessionId);
+                try {
+                    getOrCreateSession(sessionId);
+                } catch (e) {
+                    console.error(`[${sessionId}] retry failed:`, e.message);
+                }
+            }, 10000);
+        }
     });
     return s;
 }
 
 // Start (or resume) a session for a sender.
-app.post('/sessions/:id/start', requireApiKey, requireSessionAccess, (req, res) => {
-    const s = getOrCreateSession(req.params.id);
+app.post('/sessions/:id/start', requireApiKey, requireSessionAccess, async (req, res) => {
+    const sessionId = req.params.id;
+    const existing = sessions.get(sessionId);
+
+    // Pressing "connect" on a dead session must genuinely restart it. This is
+    // what used to require restarting the whole gateway process after every
+    // LOGOUT: the dead entry was returned as-is and never re-initialized.
+    if (existing && existing.status === 'disconnected') {
+        console.log(`[${sessionId}] restarting a disconnected session`);
+        await destroySession(sessionId);
+        // Give Chromium a moment to release its file handles, or LocalAuth
+        // trips over EBUSY on Windows when it reopens the same profile.
+        await new Promise((r) => setTimeout(r, 1500));
+    }
+
+    const s = getOrCreateSession(sessionId);
     res.json({ ok: true, status: s.status });
 });
 
@@ -165,8 +275,10 @@ app.post('/sessions/:id/logout', requireApiKey, requireSessionAccess, async (req
     if (!s) return res.json({ ok: true });
     try {
         await s.client.logout();
-    } catch (e) { /* ignore */ }
-    sessions.delete(req.params.id);
+    } catch (e) { /* ignore - Windows EBUSY on the profile folder is common */ }
+    // Close the browser too, not just forget the entry: dropping the map entry
+    // alone leaks a live Chromium (~200MB) for the life of the process.
+    await destroySession(req.params.id);
     res.json({ ok: true });
 });
 
@@ -235,6 +347,78 @@ app.post('/send-document', requireApiKey, requireSessionAccess, async (req, res)
     }
 });
 
+// Re-open every session that already has a saved login on disk.
+//
+// Without this, the `sessions` Map starts empty after every restart/deploy and
+// /send answers "not connected" until a human opens the settings page and
+// presses "connect" - which is why clients believed they had to re-scan after
+// every restart. They never did: LocalAuth keeps the login in
+// .wwebjs_auth/session-<id>, so this reconnects silently with no QR.
+//
+// Staggered because each session is a full Chromium (~200MB); starting a
+// dozen at once would spike RAM hard enough to get them OOM-killed.
+function restoreSessions() {
+    const fs = require('fs');
+    const path = require('path');
+    const authDir = path.join(__dirname, '.wwebjs_auth');
+
+    let entries;
+    try {
+        entries = fs.readdirSync(authDir, { withFileTypes: true });
+    } catch (err) {
+        console.log('[restore] no .wwebjs_auth yet - nothing to restore');
+        return;
+    }
+
+    const ids = entries
+        .filter((e) => e.isDirectory() && e.name.startsWith('session-'))
+        .map((e) => e.name.slice('session-'.length));
+
+    if (!ids.length) {
+        console.log('[restore] no saved sessions found');
+        return;
+    }
+
+    console.log(`[restore] found ${ids.length} saved session(s): ${ids.join(', ')}`);
+
+    // SEQUENTIAL, not staggered by a fixed delay. Booting several Chromiums at
+    // once starves them and whatsapp-web.js dies mid-injection with
+    // "Execution context was destroyed, most likely because of a navigation".
+    // So: start one, wait until it settles (qr / connected / disconnected) or
+    // times out, only then start the next.
+    (async () => {
+        for (const id of ids) {
+            console.log(`[restore] starting ${id}`);
+            try {
+                getOrCreateSession(id);
+            } catch (err) {
+                console.error(`[restore] ${id} failed:`, err.message);
+                continue;
+            }
+
+            const startedAt = Date.now();
+            const TIMEOUT_MS = 120000;
+            while (Date.now() - startedAt < TIMEOUT_MS) {
+                const s = sessions.get(id);
+                if (!s || s.status !== 'starting') break;
+                await new Promise((r) => setTimeout(r, 2000));
+            }
+
+            const s = sessions.get(id);
+            const status = s ? s.status : 'gone';
+            console.log(`[restore] ${id} settled as "${status}"`);
+            if (status === 'qr') {
+                console.log(`[restore] ${id} has NO valid saved login - it needs a QR scan once`);
+            }
+            // Small gap so the previous browser finishes settling before the
+            // next one competes for CPU.
+            await new Promise((r) => setTimeout(r, 3000));
+        }
+        console.log('[restore] done');
+    })();
+}
+
 app.listen(PORT, () => {
     console.log(`wa-gateway listening on http://localhost:${PORT}`);
+    restoreSessions();
 });

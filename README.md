@@ -93,7 +93,7 @@ SCOPED_API_KEYS=naweb-autonation:8f2a...,naweb-starchem:1c9e...,gweb-shopa:44bb.
 
 ### Do this, in order
 
-  1. Invent a password (or openssl rand -hex 32). or from `https://www.browserling.com/tools/random-hex` Say you pick:
+  1. Invent a password (or openssl rand -hex 32). or from `https://www.browserling.com/tools/random-hex` for example:
   kJ8mN2pQ7rT4vX9wZ3aB6cD1eF5gH0iL
 
   2. wa-gateway .env on the server:
