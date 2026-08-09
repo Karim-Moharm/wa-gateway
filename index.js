@@ -581,9 +581,13 @@ function restoreSessions() {
         return;
     }
 
-    // Each restored session is a full Chromium (~200-500MB). Restoring every
-    // folder found is how a box ends up with 18 browsers and no RAM left.
-    const MAX_RESTORE = parseInt(process.env.MAX_RESTORE_SESSIONS || '6', 10);
+    // OPT-IN. Auto-restore is a convenience on a machine with spare RAM and a
+    // liability on one without: each session is a full Chromium (200-500MB),
+    // and on a loaded host they queue up half-booted, starving each other so
+    // none ever connects. Default 0 = behave exactly as before this feature
+    // existed - sessions start when someone presses connect.
+    //   MAX_RESTORE_SESSIONS=4 pm2 restart wa-gateway --update-env
+    const MAX_RESTORE = parseInt(process.env.MAX_RESTORE_SESSIONS || '0', 10);
     const ids = all.slice(0, MAX_RESTORE).map((x) => x.id);
     const skipped = all.slice(MAX_RESTORE).map((x) => x.id);
 
@@ -618,6 +622,19 @@ function restoreSessions() {
 
             const s = sessions.get(id);
             const status = s ? s.status : 'gone';
+
+            // Still "starting" means the wait EXPIRED, not that it settled.
+            // Launching the next browser now is what produced the pile-up:
+            // several half-booted Chromiums starving each other so none ever
+            // connects. Stop the queue and leave the machine to finish this
+            // one; the rest start on demand when someone presses connect.
+            if (status === 'starting') {
+                console.warn(`[restore] ${id} did NOT come up within ${TIMEOUT_MS / 1000}s - `
+                    + `stopping auto-restore so it does not starve the browsers already running. `
+                    + `Remaining sessions will start on demand.`);
+                break;
+            }
+
             console.log(`[restore] ${id} settled as "${status}"`);
             if (status === 'qr') {
                 console.log(`[restore] ${id} has NO valid saved login - it needs a QR scan once`);
