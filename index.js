@@ -555,16 +555,43 @@ function restoreSessions() {
         return;
     }
 
-    const ids = entries
+    // MOST RECENTLY USED FIRST. The auth folder accumulates sessions for
+    // senders that were deleted long ago; restoring in directory order put
+    // those dead ones ahead of the live ones, so a client's working sender
+    // could sit at "not_started" for ten minutes after a restart while the
+    // queue chewed through junk that will only ever reach "qr".
+    const all = entries
         .filter((e) => e.isDirectory() && e.name.startsWith('session-'))
-        .map((e) => e.name.slice('session-'.length));
+        .map((e) => {
+            const id = e.name.slice('session-'.length);
+            let mtime = 0;
+            try {
+                // Default/ is rewritten as the session is actually used, so it
+                // tracks real activity better than the parent directory.
+                mtime = fs.statSync(path.join(authDir, e.name, 'Default')).mtimeMs;
+            } catch (err) {
+                try { mtime = fs.statSync(path.join(authDir, e.name)).mtimeMs; } catch (e2) { /* keep 0 */ }
+            }
+            return { id, mtime };
+        })
+        .sort((a, b) => b.mtime - a.mtime);
 
-    if (!ids.length) {
+    if (!all.length) {
         console.log('[restore] no saved sessions found');
         return;
     }
 
-    console.log(`[restore] found ${ids.length} saved session(s): ${ids.join(', ')}`);
+    // Each restored session is a full Chromium (~200-500MB). Restoring every
+    // folder found is how a box ends up with 18 browsers and no RAM left.
+    const MAX_RESTORE = parseInt(process.env.MAX_RESTORE_SESSIONS || '6', 10);
+    const ids = all.slice(0, MAX_RESTORE).map((x) => x.id);
+    const skipped = all.slice(MAX_RESTORE).map((x) => x.id);
+
+    console.log(`[restore] ${all.length} saved session(s) on disk; restoring the ${ids.length} most recently used`);
+    if (skipped.length) {
+        console.log(`[restore] NOT auto-restoring ${skipped.length} older session(s) `
+            + `(they still work - press connect to start one): ${skipped.join(', ')}`);
+    }
 
     // SEQUENTIAL, not staggered by a fixed delay. Booting several Chromiums at
     // once starves them and whatsapp-web.js dies mid-injection with
