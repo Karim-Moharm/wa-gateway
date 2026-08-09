@@ -29,6 +29,33 @@ const SCOPED_API_KEYS = new Map(); // key -> prefix
 // forces them all to reconnect - a bad trade for a config change that affects
 // nobody but the new client. This reloads the keys in place; live sessions are
 // untouched.
+// Keys minted by POST /provision live here, NOT in .env. Keeping the two apart
+// means code never rewrites a file you maintain by hand, so an existing
+// client's entry can't be mangled by a bug in the provisioning path.
+const PROVISIONED_FILE = require('path').join(__dirname, 'provisioned-keys.json');
+
+function readProvisionedKeys() {
+    try {
+        const txt = require('fs').readFileSync(PROVISIONED_FILE, 'utf8');
+        const obj = JSON.parse(txt);
+        return obj && typeof obj === 'object' ? obj : {};
+    } catch (err) {
+        if (err.code !== 'ENOENT') {
+            console.error('[provision] could not read provisioned-keys.json:', err.message);
+        }
+        return {};
+    }
+}
+
+function writeProvisionedKeys(map) {
+    // Write-then-rename: a crash mid-write must not leave a truncated file that
+    // would silently drop every provisioned client on the next reload.
+    const fs = require('fs');
+    const tmp = PROVISIONED_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(map, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, PROVISIONED_FILE);
+}
+
 function loadScopedApiKeys() {
     const fs = require('fs');
     const path = require('path');
@@ -57,9 +84,30 @@ function loadScopedApiKeys() {
         next.set(key, prefix);
     });
 
+    // Provisioned keys layer ON TOP of .env, never replacing it: every entry
+    // you added by hand keeps working exactly as before.
+    const provisioned = readProvisionedKeys();
+    Object.keys(provisioned).forEach((prefix) => {
+        const key = String(provisioned[prefix] || '').trim();
+        if (prefix && key) next.set(key, prefix);
+    });
+
     SCOPED_API_KEYS.clear();
     next.forEach((prefix, key) => SCOPED_API_KEYS.set(key, prefix));
-    console.log(`[config] loaded ${SCOPED_API_KEYS.size} scoped API key(s): ${[...SCOPED_API_KEYS.values()].join(', ')}`);
+    const envCount = SCOPED_API_KEYS.size - Object.keys(provisioned).length;
+    console.log(`[config] loaded ${SCOPED_API_KEYS.size} scoped API key(s) `
+        + `(${Math.max(0, envCount)} from .env, ${Object.keys(provisioned).length} provisioned): `
+        + `${[...SCOPED_API_KEYS.values()].join(', ')}`);
+}
+
+// The key for a prefix, from EITHER source. Used by /provision so an already
+// working client - whose key lives in .env - gets that same key back instead
+// of a second one that would disagree with his app's config.
+function keyForPrefix(prefix) {
+    for (const [key, pfx] of SCOPED_API_KEYS.entries()) {
+        if (pfx === prefix) return key;
+    }
+    return null;
 }
 
 loadScopedApiKeys();
@@ -79,6 +127,26 @@ try {
     });
 } catch (err) {
     console.warn('[config] could not watch .env (edit + SIGHUP still works):', err.message);
+}
+
+// Watch the provisioned key store too. Without this, deleting or editing
+// provisioned-keys.json to revoke a client has no effect until a restart -
+// the keys stay live in memory, which is the opposite of what deleting a
+// credentials file should mean. fs.watch on a file that may not exist yet
+// throws, so watch the directory and filter.
+try {
+    const fs = require('fs');
+    let pending = null;
+    fs.watch(__dirname, (evt, filename) => {
+        if (filename !== 'provisioned-keys.json') return;
+        clearTimeout(pending);
+        pending = setTimeout(() => {
+            console.log('[config] provisioned-keys.json changed - reloading');
+            loadScopedApiKeys();
+        }, 500);
+    });
+} catch (err) {
+    console.warn('[config] could not watch provisioned-keys.json:', err.message);
 }
 
 // Manual reload for hosts where file watching is unreliable (some Docker
@@ -107,6 +175,68 @@ app.use((req, res, next) => {
 
 // sessionId -> { client, status: 'starting'|'qr'|'connected'|'disconnected', qr, number }
 const sessions = new Map();
+
+// ---------------------------------------------------------------------------
+// Self-service provisioning
+//
+// A client's Django app asks its OWN gateway (always http://localhost:3001,
+// same machine) for a scoped key. The gateway mints it, persists it and hands
+// it back; the app stores it itself. Nobody edits .env, nobody SSHes in, and
+// the app physically cannot reach the other server's gateway - which is what
+// made "key added to the wrong VPS" possible before.
+//
+// Loopback IS the authentication. It is checked on the socket, never from a
+// header: X-Forwarded-For is attacker-controlled and trusting it would expose
+// key minting to the internet if port 3001 is not firewalled.
+// ---------------------------------------------------------------------------
+function isLoopback(req) {
+    const addr = (req.socket && req.socket.remoteAddress) || '';
+    return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1';
+}
+
+app.post('/provision', (req, res) => {
+    if (!isLoopback(req)) {
+        console.warn(`[provision] REFUSED non-loopback request from ${req.socket && req.socket.remoteAddress}`);
+        return res.status(403).json({ ok: false, error: 'provisioning is only allowed from this machine' });
+    }
+
+    const prefix = String((req.body && req.body.prefix) || '').trim();
+    const existingKey = String((req.body && req.body.existing_key) || '').trim();
+
+    // The prefix becomes a session-id namespace, so keep it to the shape the
+    // apps actually generate. A prefix with a comma would corrupt .env parsing
+    // if it were ever copied there by hand.
+    if (!/^[a-z0-9][a-z0-9-]{2,80}$/i.test(prefix)) {
+        return res.status(400).json({ ok: false, error: 'invalid prefix' });
+    }
+
+    const current = keyForPrefix(prefix);
+    if (current) {
+        // Already known - from .env OR from a previous provision. Hand back the
+        // same key only to a caller that can already prove it holds it, so one
+        // app on this box cannot read another client's key by guessing prefixes.
+        if (existingKey && existingKey === current) {
+            return res.json({ ok: true, prefix, api_key: current, created: false });
+        }
+        return res.status(409).json({
+            ok: false,
+            error: 'this prefix is already provisioned; send its current key as existing_key to retrieve it',
+        });
+    }
+
+    const key = require('crypto').randomBytes(32).toString('hex');
+    const map = readProvisionedKeys();
+    map[prefix] = key;
+    try {
+        writeProvisionedKeys(map);
+    } catch (err) {
+        console.error('[provision] could not persist key:', err.message);
+        return res.status(500).json({ ok: false, error: 'could not persist the key' });
+    }
+    loadScopedApiKeys();   // live, no restart
+    console.log(`[provision] minted a key for "${prefix}"`);   // never log the key itself
+    return res.json({ ok: true, prefix, api_key: key, created: true });
+});
 
 function requireApiKey(req, res, next) {
     const key = req.get('X-API-KEY');

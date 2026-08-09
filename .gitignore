@@ -7,6 +7,10 @@ node_modules/
 .wwebjs_auth/
 .wwebjs_cache/
 
+# Keys minted by POST /provision - real per-client secrets, per-server
+provisioned-keys.json
+provisioned-keys.json.tmp
+
 # OS/editor cruft
 .DS_Store
 *.log
