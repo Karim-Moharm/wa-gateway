@@ -415,6 +415,26 @@ app.post('/sessions/:id/logout', requireApiKey, requireSessionAccess, async (req
 // Shared preflight: session must exist and be connected, phone must resolve
 // to a real WhatsApp account. Returns { session: s, numberId } or writes an
 // error response and returns null.
+// whatsapp-web.js calls can hang indefinitely when WhatsApp Web is slow or the
+// browser is starved (several Chromiums on one box, tight RAM). Unbounded, the
+// caller's own HTTP timeout fires first and the send is recorded as FAILED
+// while the gateway quietly goes on to deliver it - so a retry sends the same
+// invoice to the customer twice. Every step is bounded well inside the 60s
+// Django allows, so a stall becomes a clear error instead of a silent double
+// send.
+function withTimeout(promise, ms, label) {
+    let timer;
+    return Promise.race([
+        promise,
+        new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms / 1000}s`)), ms);
+        }),
+    ]).finally(() => clearTimeout(timer));
+}
+
+const LOOKUP_TIMEOUT_MS = 15000;
+const SEND_TIMEOUT_MS = 35000;   // 15 + 35 = 50s < the caller's 60s
+
 async function resolveSendTarget(req, res) {
     const { session, phone } = req.body || {};
     const s = sessions.get(session);
@@ -430,7 +450,16 @@ async function resolveSendTarget(req, res) {
     // sendMessage() crashes with an opaque internal error (e.g. "Cannot read
     // properties of undefined (reading 'id')") when the number isn't
     // registered on WhatsApp at all. Checking first gives a clear error.
-    const numberId = await s.client.getNumberId(digits);
+    const t0 = Date.now();
+    let numberId;
+    try {
+        numberId = await withTimeout(s.client.getNumberId(digits), LOOKUP_TIMEOUT_MS, 'number lookup');
+    } catch (e) {
+        console.error(`[${session}] ${e.message} (${Date.now() - t0}ms)`);
+        res.status(504).json({ ok: false, error: 'الخدمة بطيئة حاليا، لم يتم الارسال. حاول مرة اخرى.' });
+        return null;
+    }
+    console.log(`[${session}] number lookup took ${Date.now() - t0}ms`);
     if (!numberId) {
         res.status(400).json({ ok: false, error: `الرقم ${digits} غير مسجل على واتساب` });
         return null;
@@ -448,11 +477,23 @@ app.post('/send', requireApiKey, requireSessionAccess, async (req, res) => {
     try {
         const target = await resolveSendTarget(req, res);
         if (!target) return;
-        const sent = await target.s.client.sendMessage(target.numberId._serialized, message);
+        const t0 = Date.now();
+        const sent = await withTimeout(
+            target.s.client.sendMessage(target.numberId._serialized, message),
+            SEND_TIMEOUT_MS,
+            'send',
+        );
+        console.log(`[${session}] send took ${Date.now() - t0}ms`);
         res.json({ ok: true, id: (sent && sent.id) ? sent.id._serialized : null });
     } catch (e) {
-        console.error(`[${session}] send failed:`, e);
-        res.status(500).json({ ok: false, error: e.message || String(e) });
+        console.error(`[${session}] send failed:`, e.message || e);
+        const timedOut = /timed out/.test(e.message || '');
+        res.status(timedOut ? 504 : 500).json({
+            ok: false,
+            error: timedOut
+                ? 'انتهت المهلة. قد تكون الرسالة قد أُرسلت بالفعل - تحقق قبل إعادة المحاولة.'
+                : (e.message || String(e)),
+        });
     }
 });
 
@@ -467,13 +508,27 @@ app.post('/send-document', requireApiKey, requireSessionAccess, async (req, res)
         const target = await resolveSendTarget(req, res);
         if (!target) return;
         const media = new MessageMedia('application/pdf', pdf_base64, filename || 'document.pdf');
-        const sent = await target.s.client.sendMessage(target.numberId._serialized, media, {
-            caption: message || undefined,
-        });
+        const t0 = Date.now();
+        const sent = await withTimeout(
+            target.s.client.sendMessage(target.numberId._serialized, media, {
+                caption: message || undefined,
+            }),
+            SEND_TIMEOUT_MS,
+            'send-document',
+        );
+        console.log(`[${session}] send-document took ${Date.now() - t0}ms`);
         res.json({ ok: true, id: (sent && sent.id) ? sent.id._serialized : null });
     } catch (e) {
-        console.error(`[${session}] send-document failed:`, e);
-        res.status(500).json({ ok: false, error: e.message || String(e) });
+        console.error(`[${session}] send-document failed:`, e.message || e);
+        // A timeout here is genuinely ambiguous: WhatsApp may still deliver it.
+        // Say so, so nobody retries blindly and sends the invoice twice.
+        const timedOut = /timed out/.test(e.message || '');
+        res.status(timedOut ? 504 : 500).json({
+            ok: false,
+            error: timedOut
+                ? 'انتهت المهلة. قد تكون الرسالة قد أُرسلت بالفعل - تحقق قبل إعادة المحاولة.'
+                : (e.message || String(e)),
+        });
     }
 });
 
