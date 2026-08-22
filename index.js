@@ -281,6 +281,24 @@ async function destroySession(sessionId) {
     }
 }
 
+// Cuts a session from ~700MB to ~300MB, and stops Chromium throttling our
+// permanently-backgrounded tab (a throttled tab is what the lookup timeouts
+// were waiting on).
+const CHROME_ARGS = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+    '--disable-gpu',
+    '--disable-software-rasterizer',
+    '--disable-extensions',
+    '--disable-accelerated-2d-canvas',
+    '--renderer-process-limit=1',
+    '--disable-background-timer-throttling',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-renderer-backgrounding',
+    '--js-flags=--max-old-space-size=384',
+];
+
 function getOrCreateSession(sessionId) {
     let s = sessions.get(sessionId);
     // A dead session must NOT be handed back: whatsapp-web.js will never
@@ -295,12 +313,15 @@ function getOrCreateSession(sessionId) {
 
     const client = new Client({
         authStrategy: new LocalAuth({ clientId: sessionId }),
-        puppeteer: { args: ['--no-sandbox', '--disable-setuid-sandbox'] },
+        puppeteer: { args: CHROME_ARGS },
     });
 
     client.on('qr', (qr) => {
         s.status = 'qr';
         s.qr = qr;
+        // No usable saved login. The watchdog must leave this one alone: no
+        // amount of restarting produces a connection, only a human scanning.
+        s.needsQr = true;
         console.log(`[${sessionId}] qr generated (scan within ~20s, it rotates)`);
     });
 
@@ -315,6 +336,8 @@ function getOrCreateSession(sessionId) {
     client.on('ready', () => {
         s.status = 'connected';
         s.qr = null;
+        s.needsQr = false;
+        s.retried = false;   // a clean connect earns the session a fresh retry budget
         s.number = client.info && client.info.wid ? client.info.wid.user : null;
         console.log(`[${sessionId}] connected as ${s.number}`);
     });
@@ -368,6 +391,7 @@ function getOrCreateSession(sessionId) {
 app.post('/sessions/:id/start', requireApiKey, requireSessionAccess, async (req, res) => {
     const sessionId = req.params.id;
     const existing = sessions.get(sessionId);
+    noAutoStart.delete(sessionId);
 
     // Pressing "connect" on a dead session must genuinely restart it. This is
     // what used to require restarting the whole gateway process after every
@@ -432,20 +456,70 @@ function withTimeout(promise, ms, label) {
     ]).finally(() => clearTimeout(timer));
 }
 
-const LOOKUP_TIMEOUT_MS = 15000;
-const SEND_TIMEOUT_MS = 35000;   // 15 + 35 = 50s < the caller's 60s
+const LOOKUP_TIMEOUT_MS = 12000;
+const SEND_TIMEOUT_MS = 25000;
+const HEAL_WAIT_MS = 15000;      // 15 + 12 + 25 = 52s < the caller's 60s
+
+// getNumberId() is the step that times out first when the browser is starved,
+// and its answer never changes. Cache it.
+const numberIdCache = new Map();   // "session|digits" -> { id, at }
+const NUMBER_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** Bring a session up if it is missing or dead, WITHOUT asking anyone to scan.
+ *  A profile with a valid saved login only needs initialize() - the QR is a
+ *  one-time thing. Returns the session if it reached "connected" in time. */
+async function healSession(sessionId) {
+    let s = sessions.get(sessionId);
+    if (s && s.status === 'connected') return s;
+    if (s && s.status === 'qr') return null;          // genuinely needs a human
+    if (!hasSavedLogin(sessionId)) return null;       // never scanned - nothing to restore
+
+    if (!s || s.status === 'disconnected') {
+        console.log(`[${sessionId}] not connected on send - reconnecting from saved login`);
+        if (s) await destroySession(sessionId);
+        noAutoStart.delete(sessionId);
+        getOrCreateSession(sessionId);
+    }
+
+    const until = Date.now() + HEAL_WAIT_MS;
+    while (Date.now() < until) {
+        s = sessions.get(sessionId);
+        if (!s || s.status === 'qr' || s.status === 'disconnected') return null;
+        if (s.status === 'connected') return s;
+        await new Promise((r) => setTimeout(r, 500));
+    }
+    return null;   // still booting; the watchdog carries on without the caller
+}
 
 async function resolveSendTarget(req, res) {
     const { session, phone } = req.body || {};
-    const s = sessions.get(session);
+    let s = sessions.get(session);
     if (!s || s.status !== 'connected') {
-        res.status(409).json({ ok: false, error: `session '${session}' not connected` });
+        s = await healSession(session);
+    }
+    if (!s || s.status !== 'connected') {
+        const cur = sessions.get(session);
+        const needsScan = cur && cur.status === 'qr';
+        res.status(409).json({
+            ok: false,
+            error: needsScan
+                ? `session '${session}' needs a QR scan`
+                : (cur && cur.status === 'starting'
+                    ? 'جاري إعادة الاتصال بالواتساب، حاول مرة اخرى بعد دقيقة.'
+                    : `session '${session}' not connected`),
+        });
         return null;
     }
     const digits = String(phone || '').replace(/\D/g, '');
     if (!digits) {
         res.status(400).json({ ok: false, error: 'invalid phone' });
         return null;
+    }
+
+    const cacheKey = `${session}|${digits}`;
+    const hit = numberIdCache.get(cacheKey);
+    if (hit && Date.now() - hit.at < NUMBER_CACHE_TTL_MS) {
+        return { s, numberId: hit.id };
     }
     // sendMessage() crashes with an opaque internal error (e.g. "Cannot read
     // properties of undefined (reading 'id')") when the number isn't
@@ -464,6 +538,7 @@ async function resolveSendTarget(req, res) {
         res.status(400).json({ ok: false, error: `الرقم ${digits} غير مسجل على واتساب` });
         return null;
     }
+    numberIdCache.set(cacheKey, { id: numberId, at: Date.now() });
     return { s, numberId };
 }
 
@@ -587,7 +662,7 @@ function restoreSessions() {
     // none ever connects. Default 0 = behave exactly as before this feature
     // existed - sessions start when someone presses connect.
     //   MAX_RESTORE_SESSIONS=4 pm2 restart wa-gateway --update-env
-    const MAX_RESTORE = parseInt(process.env.MAX_RESTORE_SESSIONS || '0', 10);
+    const MAX_RESTORE = parseInt(process.env.MAX_RESTORE_SESSIONS || '6', 10);
     const ids = all.slice(0, MAX_RESTORE).map((x) => x.id);
     const skipped = all.slice(MAX_RESTORE).map((x) => x.id);
 
@@ -647,7 +722,64 @@ function restoreSessions() {
     })();
 }
 
+// Sessions that reached "qr": no saved login, so restarting them is pointless.
+// Cleared when a human presses connect or the session goes ready.
+const noAutoStart = new Set();
+
+function hasSavedLogin(sessionId) {
+    const fs = require('fs');
+    const path = require('path');
+    return fs.existsSync(path.join(__dirname, '.wwebjs_auth', `session-${sessionId}`, 'Default'));
+}
+
+// Keeps every session that has a saved login connected, without anyone pressing
+// anything. One boot at a time - never while another session is still starting.
+function startWatchdog() {
+    const fs = require('fs');
+    const path = require('path');
+    const authDir = path.join(__dirname, '.wwebjs_auth');
+    const INTERVAL_MS = 45000;
+    const COOLDOWN_MS = 5 * 60 * 1000;
+    const lastBoot = new Map();
+
+    setInterval(() => {
+        for (const [id, s] of sessions) {
+            if (s.status === 'qr') noAutoStart.add(id);
+            if (s.status === 'starting') return;
+        }
+
+        let entries;
+        try {
+            entries = fs.readdirSync(authDir, { withFileTypes: true });
+        } catch (err) {
+            return;
+        }
+
+        for (const e of entries) {
+            if (!e.isDirectory() || !e.name.startsWith('session-')) continue;
+            const id = e.name.slice('session-'.length);
+            if (noAutoStart.has(id)) continue;
+            if (!hasSavedLogin(id)) continue;
+
+            const s = sessions.get(id);
+            if (s && s.status !== 'disconnected') continue;
+            if (Date.now() - (lastBoot.get(id) || 0) < COOLDOWN_MS) continue;
+
+            lastBoot.set(id, Date.now());
+            console.log(`[watchdog] ${id} is ${s ? s.status : 'not running'} - starting it`);
+            (async () => {
+                if (s) await destroySession(id);
+                try { getOrCreateSession(id); } catch (err) {
+                    console.error(`[watchdog] ${id} failed:`, err.message);
+                }
+            })();
+            return;
+        }
+    }, INTERVAL_MS);
+}
+
 app.listen(PORT, () => {
     console.log(`wa-gateway listening on http://localhost:${PORT}`);
     restoreSessions();
+    startWatchdog();
 });
