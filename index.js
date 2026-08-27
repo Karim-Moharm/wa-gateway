@@ -299,7 +299,32 @@ const CHROME_ARGS = [
     '--js-flags=--max-old-space-size=384',
 ];
 
-function getOrCreateSession(sessionId) {
+// A session sitting at "qr" is a full Chromium rendering a code that rotates
+// every ~20s. If nobody is watching the settings page it will do that until
+// the process dies, stealing memory and CPU from the sessions that work.
+const QR_IDLE_MS = 3 * 60 * 1000;
+
+function closeIdleQrSessions() {
+    for (const [id, s] of sessions) {
+        if (s.status !== 'qr') continue;
+        // Started by restore/watchdog, not by a person: nobody is looking at
+        // it, so there is no reason to keep the browser open at all.
+        if (!s.startedByHuman) {
+            console.log(`[${id}] at qr with no saved login and nobody waiting - closing it`);
+            noAutoStart.add(id);
+            destroySession(id).catch(() => {});
+            continue;
+        }
+        const waitingSince = s.lastQrFetch || s.qrSince || 0;
+        if (Date.now() - waitingSince > QR_IDLE_MS) {
+            console.log(`[${id}] qr unscanned for ${QR_IDLE_MS / 60000} minutes - closing it`);
+            noAutoStart.add(id);
+            destroySession(id).catch(() => {});
+        }
+    }
+}
+
+function getOrCreateSession(sessionId, startedByHuman) {
     let s = sessions.get(sessionId);
     // A dead session must NOT be handed back: whatsapp-web.js will never
     // re-initialize it, so the UI would sit on "disconnected" forever and the
@@ -308,7 +333,10 @@ function getOrCreateSession(sessionId) {
     if (s && s.status !== 'disconnected') return s;
     if (s) sessions.delete(sessionId);
 
-    s = { client: null, status: 'starting', qr: null, number: null };
+    s = {
+        client: null, status: 'starting', qr: null, number: null,
+        startedByHuman: !!startedByHuman,
+    };
     sessions.set(sessionId, s);
 
     const client = new Client({
@@ -322,7 +350,10 @@ function getOrCreateSession(sessionId) {
         // No usable saved login. The watchdog must leave this one alone: no
         // amount of restarting produces a connection, only a human scanning.
         s.needsQr = true;
-        console.log(`[${sessionId}] qr generated (scan within ~20s, it rotates)`);
+        if (!s.qrSince) {
+            s.qrSince = Date.now();
+            console.log(`[${sessionId}] qr generated (scan within ~20s, it rotates)`);
+        }
     });
 
     client.on('loading_screen', (percent, message) => {
@@ -337,6 +368,7 @@ function getOrCreateSession(sessionId) {
         s.status = 'connected';
         s.qr = null;
         s.needsQr = false;
+        s.qrSince = null;
         s.retried = false;   // a clean connect earns the session a fresh retry budget
         s.number = client.info && client.info.wid ? client.info.wid.user : null;
         console.log(`[${sessionId}] connected as ${s.number}`);
@@ -375,9 +407,13 @@ function getOrCreateSession(sessionId) {
             s.retried = true;
             console.log(`[${sessionId}] retrying once in 10s...`);
             setTimeout(async () => {
+                const wasHuman = s.startedByHuman;
                 await destroySession(sessionId);
                 try {
-                    getOrCreateSession(sessionId);
+                    // Keep who asked for it: a retry of a session someone is
+                    // sitting in front of must not be treated as automatic and
+                    // closed the moment it shows a QR.
+                    getOrCreateSession(sessionId, wasHuman);
                 } catch (e) {
                     console.error(`[${sessionId}] retry failed:`, e.message);
                 }
@@ -404,7 +440,9 @@ app.post('/sessions/:id/start', requireApiKey, requireSessionAccess, async (req,
         await new Promise((r) => setTimeout(r, 1500));
     }
 
-    const s = getOrCreateSession(sessionId);
+    const s = getOrCreateSession(sessionId, true);
+    s.startedByHuman = true;
+    s.lastQrFetch = Date.now();
     res.json({ ok: true, status: s.status });
 });
 
@@ -419,6 +457,8 @@ app.get('/sessions/:id/status', requireApiKey, requireSessionAccess, (req, res) 
 app.get('/sessions/:id/qr', requireApiKey, requireSessionAccess, async (req, res) => {
     const s = sessions.get(req.params.id);
     if (!s || !s.qr) return res.json({ ok: true, qr: null });
+    // Proof someone has the settings page open, so the idle sweep leaves it be.
+    s.lastQrFetch = Date.now();
     const dataUrl = await qrcode.toDataURL(s.qr);
     res.json({ ok: true, qr: dataUrl });
 });
@@ -746,6 +786,8 @@ function startWatchdog() {
     const lastBoot = new Map();
 
     setInterval(() => {
+        closeIdleQrSessions();
+
         for (const [id, s] of sessions) {
             if (s.status === 'qr') noAutoStart.add(id);
             if (s.status === 'starting') return;
