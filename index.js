@@ -529,9 +529,12 @@ async function resolveSendTarget(req, res) {
     try {
         numberId = await withTimeout(s.client.getNumberId(digits), LOOKUP_TIMEOUT_MS, 'number lookup');
     } catch (e) {
-        console.error(`[${session}] ${e.message} (${Date.now() - t0}ms)`);
-        res.status(504).json({ ok: false, error: 'الخدمة بطيئة حاليا، لم يتم الارسال. حاول مرة اخرى.' });
-        return null;
+        // The lookup is a nicety, not a requirement - sendMessage() accepts a
+        // plain "<digits>@c.us" chat id. Failing the whole send because the
+        // browser was slow to answer an optional question is worse than
+        // sending and letting the send itself report a real problem.
+        console.warn(`[${session}] ${e.message} (${Date.now() - t0}ms) - sending without it`);
+        return { s, numberId: { _serialized: `${digits}@c.us` } };
     }
     console.log(`[${session}] number lookup took ${Date.now() - t0}ms`);
     if (!numberId) {
