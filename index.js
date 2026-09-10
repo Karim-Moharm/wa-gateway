@@ -505,6 +505,25 @@ const HEAL_WAIT_MS = 15000;      // 15 + 12 + 25 = 52s < the caller's 60s
 const numberIdCache = new Map();   // "session|digits" -> { id, at }
 const NUMBER_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
+/** Is the session's page still the one whatsapp-web.js injected itself into?
+ *
+ *  A reloaded or crashed page keeps the client object alive and the status on
+ *  "connected", but window.WWebJS is gone - every send then dies with
+ *  "Cannot read properties of undefined (reading 'getChat')" until the whole
+ *  gateway is restarted. Checking is one cheap round trip. */
+async function pageAlive(s) {
+    if (!s || !s.client || !s.client.pupPage) return false;
+    try {
+        return await withTimeout(
+            s.client.pupPage.evaluate(() => typeof window.WWebJS !== 'undefined'),
+            5000,
+            'page health',
+        );
+    } catch (e) {
+        return false;
+    }
+}
+
 /** Bring a session up if it is missing or dead, WITHOUT asking anyone to scan.
  *  A profile with a valid saved login only needs initialize() - the QR is a
  *  one-time thing. Returns the session if it reached "connected" in time. */
@@ -534,6 +553,15 @@ async function healSession(sessionId) {
 async function resolveSendTarget(req, res) {
     const { session, phone } = req.body || {};
     let s = sessions.get(session);
+
+    // "connected" is not proof the page still works - see pageAlive().
+    if (s && s.status === 'connected' && !(await pageAlive(s))) {
+        console.warn(`[${session}] page lost its injected code - rebuilding the session`);
+        s.status = 'disconnected';
+        await destroySession(session);
+        s = null;
+    }
+
     if (!s || s.status !== 'connected') {
         s = await healSession(session);
     }
@@ -785,12 +813,23 @@ function startWatchdog() {
     const COOLDOWN_MS = 5 * 60 * 1000;
     const lastBoot = new Map();
 
-    setInterval(() => {
+    setInterval(async () => {
         closeIdleQrSessions();
 
         for (const [id, s] of sessions) {
             if (s.status === 'qr') noAutoStart.add(id);
             if (s.status === 'starting') return;
+        }
+
+        // Catch pages that died while idle, so the client's next send is not
+        // the thing that discovers it.
+        for (const [id, s] of sessions) {
+            if (s.status !== 'connected') continue;
+            if (await pageAlive(s)) continue;
+            console.warn(`[watchdog] ${id} reports connected but its page is dead - rebuilding`);
+            s.status = 'disconnected';
+            await destroySession(id);
+            break;
         }
 
         let entries;
