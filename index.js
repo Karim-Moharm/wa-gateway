@@ -324,6 +324,21 @@ function closeIdleQrSessions() {
     }
 }
 
+// WhatsApp Web updates can break whatsapp-web.js overnight for everyone.
+// WA_WEB_VERSION pins the last build known to work until the library catches
+// up; remove it to go back to the latest.
+function webVersionOptions() {
+    const version = (process.env.WA_WEB_VERSION || '').trim();
+    if (!version) return {};
+    return {
+        webVersion: version,
+        webVersionCache: {
+            type: 'remote',
+            remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/{version}.html',
+        },
+    };
+}
+
 function getOrCreateSession(sessionId, startedByHuman) {
     let s = sessions.get(sessionId);
     // A dead session must NOT be handed back: whatsapp-web.js will never
@@ -342,6 +357,7 @@ function getOrCreateSession(sessionId, startedByHuman) {
     const client = new Client({
         authStrategy: new LocalAuth({ clientId: sessionId }),
         puppeteer: { args: CHROME_ARGS },
+        ...webVersionOptions(),
     });
 
     client.on('qr', (qr) => {
