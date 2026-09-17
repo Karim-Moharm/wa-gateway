@@ -625,7 +625,7 @@ app.post('/send', requireApiKey, requireSessionAccess, async (req, res) => {
         if (!target) return;
         const t0 = Date.now();
         const sent = await withTimeout(
-            target.s.client.sendMessage(target.numberId._serialized, message),
+            target.s.client.sendMessage(target.numberId._serialized, message, { linkPreview: false }),
             SEND_TIMEOUT_MS,
             'send',
         );
@@ -658,6 +658,7 @@ app.post('/send-document', requireApiKey, requireSessionAccess, async (req, res)
         const sent = await withTimeout(
             target.s.client.sendMessage(target.numberId._serialized, media, {
                 caption: message || undefined,
+                linkPreview: false,
             }),
             SEND_TIMEOUT_MS,
             'send-document',
