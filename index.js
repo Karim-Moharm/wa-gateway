@@ -269,8 +269,23 @@ function requireSessionAccess(req, res, next) {
 // fresh one. Never throws: on Windows destroy() often fails with EBUSY
 // because Chromium still holds files in .wwebjs_auth - that must not stop us
 // dropping the dead entry, which is the whole point.
-async function destroySession(sessionId) {
+// `expected`, when given, is the session object the CALLER saw. It guards
+// against tearing down a session somebody else has already replaced: two
+// concurrent sends both finding the session dead used to await this on the
+// same stale object, and the slower one then deleted the entry the faster
+// one had just filled - so both went on to build a Chromium for the same
+// WhatsApp account. The two pages fight (one navigates or closes while the
+// other is mid-send), which is when sendMessage() dies with the opaque
+// "must include an id property" store error even though the lookup worked.
+async function destroySession(sessionId, expected) {
     const s = sessions.get(sessionId);
+    if (expected && s !== expected) {
+        // Already replaced. Close OUR orphan browser, leave theirs alone.
+        if (expected.client) {
+            try { await expected.client.destroy(); } catch (err) { /* ignore */ }
+        }
+        return;
+    }
     sessions.delete(sessionId);
     if (s && s.client) {
         try {
@@ -543,7 +558,19 @@ async function pageAlive(s) {
 /** Bring a session up if it is missing or dead, WITHOUT asking anyone to scan.
  *  A profile with a valid saved login only needs initialize() - the QR is a
  *  one-time thing. Returns the session if it reached "connected" in time. */
-async function healSession(sessionId) {
+// One rebuild at a time per session id. Without this lock two sends that
+// arrive together each build their own client for the same account.
+const healing = new Map();   // sessionId -> Promise
+
+function healSession(sessionId) {
+    const inFlight = healing.get(sessionId);
+    if (inFlight) return inFlight;
+    const p = _healSession(sessionId).finally(() => healing.delete(sessionId));
+    healing.set(sessionId, p);
+    return p;
+}
+
+async function _healSession(sessionId) {
     let s = sessions.get(sessionId);
     if (s && s.status === 'connected') return s;
     if (s && s.status === 'qr') return null;          // genuinely needs a human
@@ -551,7 +578,7 @@ async function healSession(sessionId) {
 
     if (!s || s.status === 'disconnected') {
         console.log(`[${sessionId}] not connected on send - reconnecting from saved login`);
-        if (s) await destroySession(sessionId);
+        if (s) await destroySession(sessionId, s);
         noAutoStart.delete(sessionId);
         getOrCreateSession(sessionId);
     }
@@ -564,6 +591,19 @@ async function healSession(sessionId) {
         await new Promise((r) => setTimeout(r, 500));
     }
     return null;   // still booting; the watchdog carries on without the caller
+}
+
+// whatsapp-web.js throws this from inside the WhatsApp Web page when the
+// chat id it was handed does not resolve to a real account:
+//   "Data passed to getter must include an id property (it's how we
+//    memoize) but got undefined"
+// Seen both when we send to an unverified "<digits>@c.us" (getNumberId
+// failed below) and when the page's injected Store was torn out from under
+// an in-flight send. The raw text is useless to a shop owner either way, so
+// say the one thing that is actionable.
+function isUnresolvableWid(err) {
+    const m = String((err && err.message) || err || '');
+    return /must include an id property|how we memoize/i.test(m);
 }
 
 async function resolveSendTarget(req, res) {
@@ -650,11 +690,14 @@ app.post('/send', requireApiKey, requireSessionAccess, async (req, res) => {
     } catch (e) {
         console.error(`[${session}] send failed:`, e.message || e);
         const timedOut = /timed out/.test(e.message || '');
-        res.status(timedOut ? 504 : 500).json({
+        const unregistered = isUnresolvableWid(e);
+        res.status(timedOut ? 504 : (unregistered ? 400 : 500)).json({
             ok: false,
             error: timedOut
                 ? 'انتهت المهلة. قد تكون الرسالة قد أُرسلت بالفعل - تحقق قبل إعادة المحاولة.'
-                : (e.message || String(e)),
+                : (unregistered
+                    ? `الرقم ${String(phone || '').replace(/\D/g, '')} غير مسجل على واتساب`
+                    : (e.message || String(e))),
         });
     }
 });
@@ -686,11 +729,14 @@ app.post('/send-document', requireApiKey, requireSessionAccess, async (req, res)
         // A timeout here is genuinely ambiguous: WhatsApp may still deliver it.
         // Say so, so nobody retries blindly and sends the invoice twice.
         const timedOut = /timed out/.test(e.message || '');
-        res.status(timedOut ? 504 : 500).json({
+        const unregistered = isUnresolvableWid(e);
+        res.status(timedOut ? 504 : (unregistered ? 400 : 500)).json({
             ok: false,
             error: timedOut
                 ? 'انتهت المهلة. قد تكون الرسالة قد أُرسلت بالفعل - تحقق قبل إعادة المحاولة.'
-                : (e.message || String(e)),
+                : (unregistered
+                    ? `الرقم ${String(phone || '').replace(/\D/g, '')} غير مسجل على واتساب`
+                    : (e.message || String(e))),
         });
     }
 });
@@ -861,6 +907,7 @@ function startWatchdog() {
             const id = e.name.slice('session-'.length);
             if (noAutoStart.has(id)) continue;
             if (!hasSavedLogin(id)) continue;
+            if (healing.has(id)) continue;   // a send is already rebuilding it
 
             const s = sessions.get(id);
             if (s && s.status !== 'disconnected') continue;
