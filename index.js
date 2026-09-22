@@ -643,7 +643,7 @@ async function resolveSendTarget(req, res) {
     const cacheKey = `${session}|${digits}`;
     const hit = numberIdCache.get(cacheKey);
     if (hit && Date.now() - hit.at < NUMBER_CACHE_TTL_MS) {
-        return { s, numberId: hit.id };
+        return { s, numberId: hit.id, verified: true };
     }
     // sendMessage() crashes with an opaque internal error (e.g. "Cannot read
     // properties of undefined (reading 'id')") when the number isn't
@@ -658,7 +658,7 @@ async function resolveSendTarget(req, res) {
         // browser was slow to answer an optional question is worse than
         // sending and letting the send itself report a real problem.
         console.warn(`[${session}] ${e.message} (${Date.now() - t0}ms) - sending without it`);
-        return { s, numberId: { _serialized: `${digits}@c.us` } };
+        return { s, numberId: { _serialized: `${digits}@c.us` }, verified: false };
     }
     console.log(`[${session}] number lookup took ${Date.now() - t0}ms`);
     if (!numberId) {
@@ -666,7 +666,7 @@ async function resolveSendTarget(req, res) {
         return null;
     }
     numberIdCache.set(cacheKey, { id: numberId, at: Date.now() });
-    return { s, numberId };
+    return { s, numberId, verified: true };
 }
 
 // Send a text message. body: { session, phone, message }
@@ -676,8 +676,9 @@ app.post('/send', requireApiKey, requireSessionAccess, async (req, res) => {
     if (!session || !phone || !message) {
         return res.status(400).json({ ok: false, error: 'session, phone and message are required' });
     }
+    let target = null;
     try {
-        const target = await resolveSendTarget(req, res);
+        target = await resolveSendTarget(req, res);
         if (!target) return;
         const t0 = Date.now();
         const sent = await withTimeout(
@@ -690,14 +691,27 @@ app.post('/send', requireApiKey, requireSessionAccess, async (req, res) => {
     } catch (e) {
         console.error(`[${session}] send failed:`, e.message || e);
         const timedOut = /timed out/.test(e.message || '');
-        const unregistered = isUnresolvableWid(e);
+        // getNumberId() CONFIRMED this number when target.verified is true, so
+        // the same crash then means the page's injected Store broke mid-send,
+        // not that the customer has no WhatsApp. Saying "not registered" there
+        // would be a confident lie about a number that is demonstrably fine.
+        const brokenStore = isUnresolvableWid(e) && target && target.verified;
+        const unregistered = isUnresolvableWid(e) && !brokenStore;
+        if (brokenStore) {
+            // The session cannot recover on its own - drop it so the next send
+            // rebuilds from the saved login instead of failing the same way.
+            console.warn(`[${session}] store broke on a confirmed number - rebuilding the session`);
+            destroySession(session, target.s).catch(() => {});
+        }
         res.status(timedOut ? 504 : (unregistered ? 400 : 500)).json({
             ok: false,
             error: timedOut
                 ? 'انتهت المهلة. قد تكون الرسالة قد أُرسلت بالفعل - تحقق قبل إعادة المحاولة.'
                 : (unregistered
                     ? `الرقم ${String(phone || '').replace(/\D/g, '')} غير مسجل على واتساب`
-                    : (e.message || String(e))),
+                    : brokenStore
+                        ? 'انقطعت جلسة الواتساب أثناء الارسال. جاري اعادة تجهيزها - حاول مرة اخرى بعد دقيقة.'
+                        : (e.message || String(e))),
         });
     }
 });
@@ -709,8 +723,9 @@ app.post('/send-document', requireApiKey, requireSessionAccess, async (req, res)
     if (!session || !phone || !pdf_base64) {
         return res.status(400).json({ ok: false, error: 'session, phone and pdf_base64 are required' });
     }
+    let target = null;
     try {
-        const target = await resolveSendTarget(req, res);
+        target = await resolveSendTarget(req, res);
         if (!target) return;
         const media = new MessageMedia('application/pdf', pdf_base64, filename || 'document.pdf');
         const t0 = Date.now();
@@ -729,14 +744,27 @@ app.post('/send-document', requireApiKey, requireSessionAccess, async (req, res)
         // A timeout here is genuinely ambiguous: WhatsApp may still deliver it.
         // Say so, so nobody retries blindly and sends the invoice twice.
         const timedOut = /timed out/.test(e.message || '');
-        const unregistered = isUnresolvableWid(e);
+        // getNumberId() CONFIRMED this number when target.verified is true, so
+        // the same crash then means the page's injected Store broke mid-send,
+        // not that the customer has no WhatsApp. Saying "not registered" there
+        // would be a confident lie about a number that is demonstrably fine.
+        const brokenStore = isUnresolvableWid(e) && target && target.verified;
+        const unregistered = isUnresolvableWid(e) && !brokenStore;
+        if (brokenStore) {
+            // The session cannot recover on its own - drop it so the next send
+            // rebuilds from the saved login instead of failing the same way.
+            console.warn(`[${session}] store broke on a confirmed number - rebuilding the session`);
+            destroySession(session, target.s).catch(() => {});
+        }
         res.status(timedOut ? 504 : (unregistered ? 400 : 500)).json({
             ok: false,
             error: timedOut
                 ? 'انتهت المهلة. قد تكون الرسالة قد أُرسلت بالفعل - تحقق قبل إعادة المحاولة.'
                 : (unregistered
                     ? `الرقم ${String(phone || '').replace(/\D/g, '')} غير مسجل على واتساب`
-                    : (e.message || String(e))),
+                    : brokenStore
+                        ? 'انقطعت جلسة الواتساب أثناء الارسال. جاري اعادة تجهيزها - حاول مرة اخرى بعد دقيقة.'
+                        : (e.message || String(e))),
         });
     }
 });
